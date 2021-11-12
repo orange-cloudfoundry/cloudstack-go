@@ -63,6 +63,7 @@ var mapRequireList = map[string]map[string]bool{
 	},
 }
 
+
 // nestedResponse is a prefilled map with the list of endpoints
 // that responses fields are nested in a parent object. The map value
 // gives the object field name.
@@ -71,11 +72,20 @@ var nestedResponse = map[string]string{
 	"getUploadParamsForVolume":   "getuploadparams",
 }
 
+// longToStringCompat is a prefilled map with the list of
+// response fields that migrated from long to string within
+// the current major baseline. This fields will be parsed from
+// json as string and then fallback on long.
+var longToStringCompat = map[string]bool{
+	"managementserverid": true,
+}
+
 // We prefill this one value to make sure it is not
 // created twice, as this is also a top level type.
 var typeNames = map[string]bool{"Nic": true}
 
 type apiInfo map[string][]string
+
 
 type allServices struct {
 	services services
@@ -301,6 +311,24 @@ func (as *allServices) GeneralCode() ([]byte, error) {
 	pn("	return fmt.Errorf(\"CloudStack API error %%d (CSExceptionErrorCode: %%d): %%s\", e.ErrorCode, e.CSErrorCode, e.ErrorText)")
 	pn("}")
 	pn("")
+
+	pn("type CSLong string")
+	pn("")
+	pn("func (c CSLong) MarshalJSON() ([]byte, error) {")
+	pn("	return json.Marshal(string(c))")
+	pn("}")
+	pn("")
+	pn("func (c *CSLong) UnmarshalJSON(data []byte) error {")
+	pn("	value := strings.Trim(string(data), \"\\\"\")")
+	pn("	iVal, err := strconv.ParseInt(value, 10, 64)")
+	pn("	if err == nil {")
+	pn("		*c = CSLong(fmt.Sprintf(\"%%d\", iVal))")
+	pn("	} else {")
+	pn("		*c = CSLong(value)")
+	pn("	}")
+	pn("	return nil")
+	pn("}")
+
 	pn("type CloudStackClient struct {")
 	pn("	HTTPGETOnly bool // If `true` only use HTTP GET calls")
 	pn("")
@@ -313,7 +341,7 @@ func (as *allServices) GeneralCode() ([]byte, error) {
 	pn("	timeout int64        // Max waiting timeout in seconds for async jobs to finish; defaults to 300 seconds")
 	pn("")
 	for _, s := range as.services {
-		pn("  %s *%s", strings.TrimSuffix(s.name, "Service"), s.name)
+		pn("  %s %sIface", strings.TrimSuffix(s.name, "Service"), s.name)
 	}
 	pn("}")
 	pn("")
@@ -357,6 +385,18 @@ func (as *allServices) GeneralCode() ([]byte, error) {
 	pn("	return cs")
 	pn("}")
 	pn("")
+	pn("// Creates a new mock client for communicating with CloudStack")
+	pn("func newMockClient(ctrl *gomock.Controller) *CloudStackClient {")
+	pn("	cs := &CloudStackClient{}")
+	pn("")
+	for _, s := range as.services {
+		pn("	cs.%s = NewMock%sIface(ctrl)", strings.TrimSuffix(s.name, "Service"), s.name)
+	}
+	pn("")
+	pn("	return cs")
+	pn("}")
+	pn("")
+
 	pn("// Default non-async client. So for async calls you need to implement and check the async job result yourself. When using")
 	pn("// HTTPS with a self-signed certificate to connect to your CloudStack API, you would probably want to set 'verifyssl' to")
 	pn("// false so the call ignores the SSL errors/warnings.")
@@ -371,6 +411,12 @@ func (as *allServices) GeneralCode() ([]byte, error) {
 	pn("// reached it will return the initial object containing the async job ID for the running job and a warning.")
 	pn("func NewAsyncClient(apiurl string, apikey string, secret string, verifyssl bool, options ...ClientOption) *CloudStackClient {")
 	pn("	cs := newClient(apiurl, apikey, secret, true, verifyssl, options...)")
+	pn("	return cs")
+	pn("}")
+	pn("")
+	pn("// Creates a new mock client for communicating with CloudStack")
+	pn("func NewMockClient(ctrl *gomock.Controller) *CloudStackClient {")
+	pn("	cs := newMockClient(ctrl)")
 	pn("	return cs")
 	pn("}")
 	pn("")
@@ -698,7 +744,7 @@ func (as *allServices) GeneralCode() ([]byte, error) {
 		pn("  cs *CloudStackClient")
 		pn("}")
 		pn("")
-		pn("func New%s(cs *CloudStackClient) *%s {", s.name, s.name)
+		pn("func New%s(cs *CloudStackClient) %sIface {", s.name, s.name)
 		pn("	return &%s{cs: cs}", s.name)
 		pn("}")
 		pn("")
@@ -889,6 +935,13 @@ func (s *service) GenerateCode() ([]byte, error) {
 		pn("	}")
 		pn("	p.p[param] = v")
 		pn("}")
+		pn("func (p *CustomServiceParams) GetParam(param string) (interface{}, bool) {")
+		pn("	if p.p == nil {")
+		pn("		p.p = make(map[string]interface{})")
+		pn("	}")
+		pn("	value, ok := p.p[param].(interface{})")
+		pn("	return value, ok")
+		pn("}")
 		pn("")
 		pn("func (s *CustomService) CustomRequest(api string, p *CustomServiceParams, result interface{}) error {")
 		pn("	resp, err := s.cs.newRequest(api, p.toURLValues())")
@@ -900,10 +953,12 @@ func (s *service) GenerateCode() ([]byte, error) {
 		pn("}")
 	}
 
+	s.generateInterfaceType()
+
 	for _, a := range s.apis {
 		s.generateParamType(a)
 		s.generateToURLValuesFunc(a)
-		s.generateParamSettersFunc(a)
+		s.generateParamGettersAndSettersFunc(a)
 		s.generateNewParamTypeFunc(a)
 		s.generateHelperFuncs(a)
 		s.generateNewAPICallFunc(a)
@@ -923,6 +978,92 @@ func (s *service) generateParamType(a *API) {
 
 	pn("type %s struct {", capitalize(a.Name+"Params"))
 	pn("	p map[string]interface{}")
+	pn("}\n")
+}
+
+func (s *service) generateInterfaceType() {
+	p, pn := s.p, s.pn
+
+	pn("type %sIface interface {", capitalize(s.name))
+	for _, api := range s.apis {
+		n := capitalize(api.Name)
+		tn := capitalize(api.Name + "Params")
+		// API Calls
+		pn("	%s(p *%s) (*%s, error)", n, n+"Params", strings.TrimPrefix(n, "Configure")+"Response")
+
+		// NewParam funcs
+		p("New%s(", tn)
+		for _, ap := range api.Params {
+			if ap.Required {
+				// rp = append(rp, ap)
+				p("%s %s, ", s.parseParamName(ap.Name), mapType(api.Name, ap.Name, ap.Type))
+			}
+		}
+		pn(") *%s", tn)
+
+		// Helper funcs
+		if strings.HasPrefix(api.Name, "list") {
+			v, found := hasNameOrKeywordParamField(api.Name, api.Params)
+			if found && hasIDAndNameResponseField(api.Name, api.Response) {
+				ln := strings.TrimPrefix(api.Name, "list")
+
+				// Check if ID is a required parameters and bail if so
+				for _, ap := range api.Params {
+					if ap.Required && ap.Name == "id" {
+						return
+					}
+				}
+
+				// Generate the function signature
+				p("Get%sID(%s string, ", parseSingular(ln), v)
+				for _, ap := range api.Params {
+					if ap.Required {
+						p("%s %s, ", s.parseParamName(ap.Name), mapType(api.Name, ap.Name, ap.Type))
+					}
+				}
+				if parseSingular(ln) == "Iso" {
+					p("isofilter string, ")
+				}
+				if parseSingular(ln) == "Template" || parseSingular(ln) == "Iso" {
+					p("zoneid string, ")
+				}
+				pn("opts ...OptionFunc) (string, int, error)")
+
+				if hasIDParamField(api.Name, api.Params) {
+					p("Get%sByName(name string, ", parseSingular(ln))
+					for _, ap := range api.Params {
+						if ap.Required {
+							p("%s %s, ", s.parseParamName(ap.Name), mapType(api.Name, ap.Name, ap.Type))
+						}
+					}
+					if parseSingular(ln) == "Iso" {
+						p("isofilter string, ")
+					}
+					if parseSingular(ln) == "Template" || parseSingular(ln) == "Iso" {
+						p("zoneid string, ")
+					}
+					pn("opts ...OptionFunc) (*%s, int, error)", parseSingular(ln))
+				}
+			}
+
+			if hasIDParamField(api.Name, api.Params) {
+				ln := strings.TrimPrefix(api.Name, "list")
+
+				// Generate the function signature
+				p("Get%sByID(id string, ", parseSingular(ln))
+				for _, ap := range api.Params {
+					if ap.Required && s.parseParamName(ap.Name) != "id" {
+						p("%s %s, ", ap.Name, mapType(api.Name, ap.Name, ap.Type))
+					}
+				}
+				if ln == "LoadBalancerRuleInstances" {
+					pn("opts ...OptionFunc) (*VirtualMachine, int, error)")
+				} else {
+					pn("opts ...OptionFunc) (*%s, int, error)", parseSingular(ln))
+				}
+			}
+		}
+	}
 	pn("}\n")
 }
 
@@ -1001,7 +1142,7 @@ func (s *service) parseParamName(name string) string {
 	return uncapitalize(strings.TrimSuffix(s.name, "Service")) + "Type"
 }
 
-func (s *service) generateParamSettersFunc(a *API) {
+func (s *service) generateParamGettersAndSettersFunc(a *API) {
 	pn := s.pn
 	found := make(map[string]bool)
 
@@ -1012,6 +1153,15 @@ func (s *service) generateParamSettersFunc(a *API) {
 			pn("		p.p = make(map[string]interface{})")
 			pn("	}")
 			pn("	p.p[\"%s\"] = v", ap.Name)
+			pn("}")
+			pn("")
+
+			pn("func (p *%s) Get%s() (%s, bool) {", capitalize(a.Name+"Params"), capitalize(ap.Name), mapType(a.Name, ap.Name, ap.Type))
+			pn("	if p.p == nil {")
+			pn("		p.p = make(map[string]interface{})")
+			pn("	}")
+			pn("	value, ok := p.p[\"%s\"].(%s)", ap.Name, mapType(a.Name, ap.Name, ap.Type))
+			pn("	return value, ok")
 			pn("}")
 			pn("")
 
@@ -1671,7 +1821,7 @@ func sourceDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	outdir := path.Join(path.Dir(wd), pkg)
+	outdir := path.Join(wd, pkg)
 
 	if err := os.MkdirAll(outdir, 0755); err != nil {
 		return "", fmt.Errorf("Failed to Mkdir %s: %v", outdir, err)
@@ -1680,7 +1830,13 @@ func sourceDir() (string, error) {
 }
 
 func mapType(aName string, pName string, pType string) string {
+	if _, ok := longToStringCompat[pName]; ok {
+		pType = "CSLong"
+	}
+
 	switch pType {
+	case "CSLong":
+		return "CSLong"
 	case "boolean":
 		return "bool"
 	case "short", "int", "integer":
