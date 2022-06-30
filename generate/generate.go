@@ -85,6 +85,7 @@ var typeNames = map[string]bool{"Nic": true}
 
 type apiInfo map[string][]string
 
+
 type allServices struct {
 	services services
 }
